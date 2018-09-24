@@ -1,0 +1,397 @@
+//Include the required libraries
+#include <Adafruit_ASFcore.h>
+/*/ΠΡΟΣΟΧΗ όταν δουλεύουν μαζί η βιβλιοθήκη του ραδιοφώνου <RH_RF95.h> και η βιβλιοθήκη <Adafruit_ASFcore.h> που αφορά το reset, 
+  πρέπει στο αρχείο \LIBRARIES\Adafruit_ASFcore\tc_interrupt.c να κάνουμε rem out την γραμμή 140 
+  ___MRECURSION(TC_INST_NUM, _TC_INTERRUPT_HANDLER, TC_INST_MAX_ID)___
+  αλλιώς βγάζει σφάλμα.*/
+#include <Wire.h>
+#include <SPI.h>
+#include <Timer.h> 
+#include <SD.h> 
+#include <Adafruit_Sensor.h>
+#include "SparkFunISL29125.h" //uv sensor
+#include "Adafruit_CCS811.h" //vocs sensor
+#include <RH_RF95.h> //radio lora 433Mhz
+#include "Adafruit_VEML6070.h" //UV intensity sensor
+#include <Adafruit_SleepyDog.h> //βιβλιοθήκη για reset και sleep 
+//#include <SoftwareSerial.h>
+
+// Blinky on receipt
+#define LED 13
+
+//sd card set chipselect
+const int chipSelect = 10;
+
+//Battery levels Parameters -----------------------
+#define VBATPIN A7
+
+//Εντολές προς σύγκριση στη Flash
+/*const char s1[] PROGMEM = {"epayload1"};
+const char s2[] PROGMEM = {"epayload2"};
+const char s3[] PROGMEM = {"epayload3"};
+const char s4[] PROGMEM = {"epayload4"};
+const char s5[] PROGMEM = {"epayload5"};
+*/
+//define timers -------------------
+Timer t;
+Timer ta;
+Timer tb;
+
+//UV sensor Parameters -------------------------
+Adafruit_VEML6070 uv = Adafruit_VEML6070();
+
+//RGB sensor parameters ------------------------
+SFE_ISL29125 RGB_sensor;// Declare sensor object
+
+//VOCS sensor parameters ------------------------
+Adafruit_CCS811 ccs;
+//INTEGERS to be SEND ---------------------------------
+
+int UV,VOCS,CO2; //integers to be send -  UV intensity,vocs(ppb), co2(ppm),RED, GREEN, BLUE 
+
+
+
+
+//Radio Parameters -------------------------
+/* for feather m0  */
+#define RFM95_CS 8
+#define RFM95_RST 4
+#define RFM95_INT 3
+
+// Change to 434.0 or other frequency, must match RX's freq!
+#define RF95_FREQ 433.5
+// Singleton instance of the radio driver
+RH_RF95 rf95(RFM95_CS, RFM95_INT);
+
+char* edafos;
+char serialdata[14]; //  είναι το buffer από σειριακή.
+char apostoliC[80];
+char apostoliD[60];
+
+char message1[]={"Payload_Reply1"};
+char message2[]={"Payload_Reply2"};
+char message3[]={"Reset_Pl__4sec"};
+char message4[]={"Dump_SD_serial"};
+char message5[]={"Erase__SD_data"};
+
+int val;
+//Watchdog Setup ---------------------------------
+int countdownMS;
+
+void setup()
+{
+    
+  //Initialize serial connection for debugging
+  Serial.begin(9600);
+     
+ // UV  VEML6070 SETUP ---------------
+  uv.begin(VEML6070_1_T);  // pass in the integration time constant
+
+ // RGB sensor SETUP ---------------
+ if (RGB_sensor.init())
+  { Serial.println("Sensor Initialization Successful\n\r");  }
+
+ // VOCS sensor SETUP ---------------
+if(!ccs.begin()){
+    Serial.println("Failed to start sensor! Please check your wiring.");
+   // while(1);
+  }
+  //calibrate temperature sensor
+  while(!ccs.available());
+  float temp = ccs.calculateTemperature();
+  ccs.setTempOffset(temp - 25.0);
+
+
+  //Radio SETUP ---------------
+
+  pinMode(RFM95_RST, OUTPUT);
+  digitalWrite(RFM95_RST, HIGH);
+
+  //while (!Serial);
+  Serial.begin(9600);
+  delay(100);
+
+  Serial.println("Feather LoRa TX Test!");
+
+  // manual reset
+  digitalWrite(RFM95_RST, LOW);
+  delay(10);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
+
+  while (!rf95.init()) {
+    Serial.println("LoRa radio init failed");
+    //while (1);
+  }
+  Serial.println("LoRa transmit radio init OK!");
+
+  // Defaults after init are 434.0MHz, modulation GFSK_Rb250Fd250, +13dbM
+  if (!rf95.setFrequency(RF95_FREQ)) {
+    Serial.println("setFrequency failed");
+    //while (1);
+  }
+  Serial.print("Set Freq to: "); Serial.println(RF95_FREQ);
+  
+  // Defaults after init are 434.0MHz, 13dBm, Bw = 125 kHz, Cr = 4/5, Sf = 128chips/symbol, CRC on
+
+  // The default transmitter power is 13dBm, using PA_BOOST.
+  // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then 
+  // you can set transmitter powers from 5 to 23 dBm:
+  rf95.setTxPower(23, false);
+
+  delay(500); //for everything to initialize 
+
+  //SD Card SETUP ---------------
+ 
+ // put after Radio initiallization
+ //8 is the actual CS pin for the feather. 
+ //It is inaccesible and used by the radio but must be HIGH in order for sd to work no matter what CS pin for sd is used.
+  // pinMode(8, OUTPUT);//unrem if radio off
+  //digitalWrite(8, HIGH);//unrem if radio off
+  Serial.print("Initializing SD card...");
+  if (!SD.begin(chipSelect)) {
+    Serial.println("initialization failed!");
+   // return;
+  }
+  else {
+  Serial.println("initialization done.");
+  }
+  
+ //Timers SETUP --------------- 
+  t.every(3900, payload); //kathe pote i function steilepayload
+  ta.every(21000, synchronize); //kathe pote i function synchroniza
+  tb.every(20000, timer3); //kathe pote i function timer3
+}
+//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ VOID LOOP ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+void loop()
+{
+// Disable the watchdog entirely by calling Watchdog.disable();
+ Watchdog.disable(); //Η λειτουργία Watchdog είναι για reset. Βάζω σε κάθε loop disable έτσι ώστε να γίνει μόνο κατόπιν εντολής
+   
+  t.update(); //update timer
+ ta.update();//update timer
+ tb.update();//update timer
+
+ // -------an pirame kapoia entoli tote... ------------
+    
+    uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];
+    uint8_t len = sizeof(buf);
+
+    if (rf95.recv(buf, &len)) 
+   {
+      Serial.print("Got reply:");
+      Serial.print((char*)buf);
+      
+      Serial.print("--RSSI:");
+      Serial.println(rf95.lastRssi(), DEC);    
+    }
+     
+               if (strlen((char*)buf) > 0)
+      { 
+         if (strcmp_P((char*)buf, "entoli1") == 0)    //ή σύγκριση Ram με Flash
+          { 
+           cut();
+           }
+         else if (strcmp_P((char*)buf, "entoli2") == 0)
+          { 
+           moveleft();
+           //πήγαινε ευθεία
+           }
+         else if (strcmp_P((char*)buf, "entoli3") == 0)
+          {
+          
+          }
+         else if (strcmp_P((char*)buf, "PdumpSD") == 0)
+          {
+          PdumpSD();
+    
+          }
+         else if (strcmp_P((char*)buf, "FdeleteSD") == 0)
+          {
+          PdeleteSD();
+         
+          }
+   
+         
+      }
+    void clearRxBuf(); //καθαρισμός buffer λήψης
+    memset(buf, 0, sizeof(buf)); //διαγραφή μεταβλητής buf
+
+      //-----------------receive command from serial ----------------------
+
+    while(Serial.available()) {     //όσο υπάρχει κάτι στην σειριακή
+       Serial.readBytes(serialdata, 14); //χρησιμοποιούμε readbytes γιατί έτσι την δέχεται μετά για αποστολή, to Serial.readString μετά δεν μετατρέπεται 
+       Serial.println(serialdata);
+
+    if (strcmp_P((char*)serialdata, "FdumpSD") == 0) {
+      PdumpSD();
+    }
+      if (strcmp_P((char*)serialdata, "FdeleteSD") == 0){
+      PdeleteSD();
+    }
+
+
+
+    }  
+            
+ }
+//============================Payload separate functions ==========================================
+
+//---------------synchronize loop-----------------------------
+void synchronize() {
+  Serial.println(); 
+}
+
+//---------------timer 3-----------------------------
+void timer3() 
+{
+  Serial.println();
+}
+
+//---------------steilepayload-----------------------------
+void payload()
+{
+        //*********UV
+    UV = uv.readUV();
+    // Read sensor values (16 bit integers)
+  unsigned int red = RGB_sensor.readRed();
+  unsigned int green = RGB_sensor.readGreen();
+  unsigned int blue = RGB_sensor.readBlue();
+        //*********RGB
+  // Print out readings, change HEX to DEC if you prefer decimal output
+/*  Serial.print("Red: "); Serial.println(red,DEC);
+  Serial.print("Green: "); Serial.println(green,DEC);
+  Serial.print("Blue: "); Serial.println(blue,DEC);*/
+
+  int Lred = (int)red;
+  int Lgreen = (int)green;
+  int Lblue = (int)blue;
+    
+       //*********VOCs
+    if(ccs.available()){
+    float temp = ccs.calculateTemperature();
+    if(!ccs.readData()){
+     /* Serial.print("CO2: ");
+      Serial.print(ccs.geteCO2());
+      Serial.print("ppm, TVOC: ");
+      Serial.print(ccs.getTVOC());
+      Serial.print("ppb   Temp:");
+      Serial.println(temp);*/
+    }
+    else{
+      Serial.println("vocs ERROR!");
+     // while(1);
+    }
+
+     //*********Battery
+     float measuredvbat = analogRead(VBATPIN);
+     measuredvbat *= 2;    // we divided by 2, so multiply back
+     measuredvbat *= 3.3;  // Multiply by 3.3V, our reference voltage
+     measuredvbat /= 1024; // convert to voltage
+    // Serial.print("VBat: " ); Serial.println(measuredvbat);
+
+//************Transform Data
+
+char tmp1[16], tmp2[16], tmp3[16];
+ float a = ccs.geteCO2();  
+ float b = ccs.getTVOC();
+ float c = measuredvbat;
+ 
+ ftoa(tmp1, a, 0);  //Αν θέλει περισσότερη ακρίβεια βάλε αντί 6 το 10 αλλά μεγάλωσε και τα tmp1,2 ανάλογα
+ ftoa(tmp2, b, 0);
+ ftoa(tmp3, c, 3);
+ // sprintf(apostoliC,"PAYLOAD--UV:%d,R:%u,G:%u,B:%u,CO2:%s,VOC:%s,T:%d,%s",(int)UV,int(Lred),int(Lgreen),int(Lblue), tmp1, tmp2, int(temp), tmp3);
+   sprintf(apostoliC,",,,,,,,,,,,,,,%d,%u,%u,%u,%s,%s,%d,%s",(int)UV,int(Lred),int(Lgreen),int(Lblue),tmp1,tmp2,int(temp),tmp3);  //για liveupdate 8 ΤΙΜΈΣ
+      
+      digitalWrite(LED, HIGH);
+   // rf95.send((uint8_t *)apostoliC, sizeof((uint8_t *)apostoli)); //οσο μήκος έχει ΔΕΝ ΘΕΛΕΙ ΚΕΝΑ ΤΟ ΠΑΚΕΤΟ
+      rf95.send((uint8_t *)apostoliC, 60);  // συγκεκριμένο μήκος αποστολής - πιο ασφαλές    
+      rf95.waitPacketSent();
+      digitalWrite(LED, LOW);
+      Serial.println(apostoliC);
+      apostoliC[0]='\0';
+  }
+}
+void cut(void)
+{
+  digitalWrite(LED, HIGH);
+  rf95.send((uint8_t *)message1, 14);
+  rf95.waitPacketSent();
+  digitalWrite(LED, LOW);
+}
+void moveleft()
+{
+  digitalWrite(LED, HIGH);
+  rf95.send((uint8_t *)message2, 14);
+  rf95.waitPacketSent();
+  digitalWrite(LED, LOW);
+}
+void PdumpSD(void)
+{
+  digitalWrite(LED, HIGH);
+  rf95.send((uint8_t *)message4, 14);
+  rf95.waitPacketSent();
+  digitalWrite(LED, LOW);
+     File dataFile = SD.open("datalog.txt");
+  // if the file is available, write to it:
+  Serial.println("Start of PAYLOAD SD dump");
+  if (dataFile) {
+    while (dataFile.available()) {
+      Serial.write(dataFile.read());
+    }
+    dataFile.close();
+  }
+  Serial.println("End of PAYLOAD SD dump");
+}
+void PdeleteSD(void)
+{
+  digitalWrite(LED, HIGH);
+  rf95.send((uint8_t *)message5, 14);
+  rf95.waitPacketSent();
+  digitalWrite(LED, LOW);
+  Serial.println("Removing datalog.txt...");
+  SD.remove("datalog.txt");
+}
+
+//command to convert double to string 
+char *ftoa(char *buffer, double d, int precision) {
+  long wholePart = (long) d;
+  // Deposit the whole part of the number.
+  itoa(wholePart,buffer,10);
+  // Now work on the faction if we need one.
+  if (precision > 0) {
+    // We do, so locate the end of the string and insert
+    // a decimal point.
+    char *endOfString = buffer;
+    while (*endOfString != '\0') endOfString++;
+    *endOfString++ = '.';
+    // Now work on the fraction, be sure to turn any negative
+    // values positive.
+    if (d < 0) {
+      d *= -1;
+      wholePart *= -1;
+    }
+    double fraction = d - wholePart;
+    while (precision > 0) {
+
+      // Multipleby ten and pull out the digit.
+
+      fraction *= 10;
+      wholePart = (long) fraction;
+      *endOfString++ = '0' + wholePart;
+
+      // Update the fraction and move on to the
+      // next digit.
+
+      fraction -= wholePart;
+      precision--;
+    }
+
+    // Terminate the string.
+
+    *endOfString = '\0';
+  }
+
+   return buffer;
+}
+
